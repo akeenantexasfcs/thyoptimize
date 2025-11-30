@@ -368,6 +368,10 @@ def main():
             'grids': [],
             'productivity_factor': 100
         },
+        'All Grids': {
+            'grids': '__ALL__',  # Special marker to load all available grids
+            'productivity_factor': 100
+        },
         'King Ranch Non Actives': {
             'grids': [
                 '9131 (Kleberg - TX)',
@@ -435,15 +439,20 @@ def main():
     st.subheader("Grid Selection")
     
     # Filter preset grids to only those that exist in valid_grids
-    default_grids = [g for g in preset_grids if g in valid_grids] if preset_grids else []
+    if preset_grids == '__ALL__':
+        default_grids = valid_grids  # Load all grids
+    elif preset_grids:
+        default_grids = [g for g in preset_grids if g in valid_grids]
+    else:
+        default_grids = []
+
     if not default_grids and valid_grids:
         default_grids = [valid_grids[0]]
-    
+
     selected_grids = st.multiselect(
         "Select Grids to Optimize",
         options=valid_grids,
-        default=default_grids,
-        max_selections=10
+        default=default_grids
     )
     
     if not selected_grids:
