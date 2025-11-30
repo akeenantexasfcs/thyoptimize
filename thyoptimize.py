@@ -11,10 +11,6 @@ INTERVAL_ORDER_11 = ['Jan-Feb', 'Feb-Mar', 'Mar-Apr', 'Apr-May', 'May-Jun',
 
 st.set_page_config(layout="wide", page_title="PRF Grid Optimizer")
 
-# === SESSION STATE INITIALIZATION ===
-if 'expander_states' not in st.session_state:
-    st.session_state.expander_states = {}
-
 # =============================================================================
 # === 1. CACHED DATA-LOADING FUNCTIONS (EXACT MATCH TO STUDY APP) ===
 # =============================================================================
@@ -160,67 +156,6 @@ def generate_allocations(intervals_to_use, num_intervals):
             allocations.append({intervals_to_use[i]: s[i] for i in range(6)})
 
     return allocations
-
-
-@st.cache_data
-def build_audit_dataframe(year_data_tuple, grid_id, alloc_str, acres):
-    """Cache the audit dataframe construction to avoid recomputation."""
-    audit_rows = []
-    for yd in year_data_tuple:
-        audit_rows.append({
-            'Grid': grid_id,
-            'Year': yd[0],
-            'Allocation': alloc_str,
-            'Acres': acres,
-            'Total Indemnity': f"${yd[1]:,.0f}",
-            'Producer Premium': f"${yd[2]:,.0f}",
-            'Net Return': f"${yd[3]:,.0f}",
-            'Total ROI': f"{yd[4]:.2%}"
-        })
-    return pd.DataFrame(audit_rows)
-
-
-@st.fragment
-def render_audit_section(grid_id, strategy_num, detail_key, yearly_details, alloc_str, params):
-    """Render the audit section as a fragment to prevent full page reruns."""
-    if detail_key not in yearly_details:
-        return
-
-    checkbox_key = f"audit_check_{grid_id}_{strategy_num}"
-
-    show_audit = st.checkbox(
-        "Show Year-by-Year Audit",
-        key=checkbox_key
-    )
-
-    if show_audit:
-        year_data = yearly_details[detail_key]
-
-        # Convert year_data to tuple for caching (lists aren't hashable)
-        year_data_tuple = tuple(
-            (yd['Year'], yd['Total Indemnity'], yd['Producer Premium'], yd['Net Return'], yd['ROI'])
-            for yd in year_data
-        )
-
-        audit_df = build_audit_dataframe(
-            year_data_tuple,
-            grid_id,
-            alloc_str,
-            params['total_insured_acres']
-        )
-
-        st.dataframe(audit_df, use_container_width=True, hide_index=True)
-
-        # Download button for this strategy's audit
-        audit_csv = audit_df.to_csv(index=False)
-        st.download_button(
-            "Download Audit CSV",
-            audit_csv,
-            f"audit_{grid_id}_strategy{strategy_num}.csv",
-            "text/csv",
-            key=f"audit_dl_{grid_id}_{strategy_num}"
-        )
-
 
 # =============================================================================
 # === 3. OPTIMIZATION ENGINE ===
@@ -677,18 +612,7 @@ def main():
             if 'results_df' not in data or data['results_df'].empty:
                 continue
 
-            # Track expander state in session_state to persist across reruns
-            expander_key = f"expander_{grid_id}"
-            if expander_key not in st.session_state.expander_states:
-                st.session_state.expander_states[expander_key] = False
-
-            with st.expander(
-                f"Grid {grid_id} - Top 5 Strategies",
-                expanded=st.session_state.expander_states.get(expander_key, False)
-            ):
-                # Update expander state when opened
-                st.session_state.expander_states[expander_key] = True
-
+            with st.expander(f"Grid {grid_id} - Top 5 Strategies"):
                 top5 = data['results_df'].head(5)
                 yearly_details = data.get('yearly_details', {})
 
@@ -709,19 +633,43 @@ def main():
                     col3.metric("Win Rate", f"{row['profitable_pct']:.0%}")
                     col4.metric("Median ROI", f"{row['median_roi']:.1%}")
 
-                    # === AUDIT TABLE (using fragment to prevent full page rerun) ===
+                    # === AUDIT TABLE ===
                     alloc_key = tuple(sorted((k, round(v, 3)) for k, v in row['allocation'].items() if v > 0))
                     detail_key = (row['coverage_level'], alloc_key)
 
-                    # Render audit section as a fragment (isolated rerun)
-                    render_audit_section(
-                        grid_id,
-                        strategy_num,
-                        detail_key,
-                        yearly_details,
-                        alloc_str,
-                        params
-                    )
+                    if detail_key in yearly_details:
+                        show_audit = st.checkbox(
+                            "Show Year-by-Year Audit",
+                            key=f"audit_check_{grid_id}_{strategy_num}"
+                        )
+
+                        if show_audit:
+                            year_data = yearly_details[detail_key]
+
+                            audit_rows = []
+                            for yd in year_data:
+                                audit_rows.append({
+                                    'Grid': grid_id,
+                                    'Year': yd['Year'],
+                                    'Allocation': alloc_str,
+                                    'Acres': params['total_insured_acres'],
+                                    'Total Indemnity': f"${yd['Total Indemnity']:,.0f}",
+                                    'Producer Premium': f"${yd['Producer Premium']:,.0f}",
+                                    'Net Return': f"${yd['Net Return']:,.0f}",
+                                    'Total ROI': f"{yd['ROI']:.2%}"
+                                })
+
+                            audit_df = pd.DataFrame(audit_rows)
+                            st.dataframe(audit_df, use_container_width=True, hide_index=True)
+
+                            audit_csv = audit_df.to_csv(index=False)
+                            st.download_button(
+                                "Download Audit CSV",
+                                audit_csv,
+                                f"audit_{grid_id}_strategy{strategy_num}.csv",
+                                "text/csv",
+                                key=f"audit_dl_{grid_id}_{strategy_num}"
+                            )
 
                     st.divider()
 
