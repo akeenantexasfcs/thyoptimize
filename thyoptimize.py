@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import random
 from itertools import combinations
+from decimal import Decimal, ROUND_HALF_UP
 from snowflake.snowpark.context import get_active_session
 import streamlit as st
 
@@ -10,6 +11,31 @@ INTERVAL_ORDER_11 = ['Jan-Feb', 'Feb-Mar', 'Mar-Apr', 'Apr-May', 'May-Jun',
                      'Jun-Jul', 'Jul-Aug', 'Aug-Sep', 'Sep-Oct', 'Oct-Nov', 'Nov-Dec']
 
 st.set_page_config(layout="wide", page_title="PRF Grid Optimizer")
+
+# === PRECISION HELPER FUNCTIONS (matches golden source) ===
+def round_half_up(value, decimals=2):
+    """Round using 'round half up' to match PRF official tool."""
+    if value is None or (isinstance(value, float) and (np.isnan(value) or np.isinf(value))):
+        return 0.0
+    d = Decimal(str(value))
+    if decimals == 0:
+        quantize_to = Decimal('1')
+    else:
+        quantize_to = Decimal('0.' + '0' * (decimals - 1) + '1')
+    return float(d.quantize(quantize_to, rounding=ROUND_HALF_UP))
+
+
+def calculate_protection(county_base_value, coverage_level, productivity_factor, decimals=2):
+    """Calculate dollar protection with proper precision and rounding."""
+    cbv = Decimal(str(county_base_value))
+    cov = Decimal(str(coverage_level))
+    prod = Decimal(str(productivity_factor))
+    result = cbv * cov * prod
+    if decimals == 0:
+        quantize_to = Decimal('1')
+    else:
+        quantize_to = Decimal('0.' + '0' * (decimals - 1) + '1')
+    return float(result.quantize(quantize_to, rounding=ROUND_HALF_UP))
 
 # =============================================================================
 # === 1. CACHED DATA-LOADING FUNCTIONS (EXACT MATCH TO STUDY APP) ===
@@ -246,7 +272,8 @@ def run_optimization(
     for coverage_level in coverage_levels:
         subsidy = all_subsidies[coverage_level]
         premiums = all_premiums[coverage_level]
-        dollar_protection = county_base_value * coverage_level * prod_factor
+        # Use precise calculation for dollar protection (matches golden source)
+        dollar_protection = calculate_protection(county_base_value, coverage_level, prod_factor, decimals=2)
         total_protection = dollar_protection * acres
         trigger = coverage_level * 100
         
@@ -258,51 +285,82 @@ def run_optimization(
             alloc_sum = sum(allocation.values())
             if abs(alloc_sum - 1.0) > 0.02:
                 continue
-            
-            # Build allocation array
-            alloc_array = np.array([allocation.get(interval, 0) for interval in INTERVAL_ORDER_11])
-            
-            # Vectorized calculations across all years
-            # interval_protection: shape (11,)
-            interval_protection = total_protection * alloc_array
-            
-            # total_premium per interval: shape (11,)
-            total_premium_per_interval = interval_protection * premium_rates
-            producer_premium_per_interval = total_premium_per_interval * (1 - subsidy)
-            
-            # Producer premium per year (sum across intervals): shape (num_years,)
-            yearly_producer_premium = np.sum(producer_premium_per_interval)  # Same each year
-            yearly_producer_premium_arr = np.full(len(years), yearly_producer_premium)
-            
-            # Shortfall calculation: shape (num_years, 11)
-            # Where index < trigger, shortfall = (trigger - index) / trigger
-            shortfall_matrix = np.maximum(0, (trigger - index_matrix) / trigger)
-            
-            # Indemnity per interval per year: shape (num_years, 11)
-            indemnity_matrix = shortfall_matrix * interval_protection
-            
-            # Total indemnity per year: shape (num_years,)
-            yearly_indemnity = np.nansum(indemnity_matrix, axis=1)
-            
-            # ROI per year
-            yearly_roi = np.where(
-                yearly_producer_premium > 0,
-                (yearly_indemnity - yearly_producer_premium) / yearly_producer_premium,
-                0
-            )
-            
+
+            # === PRECISE CALCULATIONS (matches golden source) ===
+            # Pre-calculate interval-level values with proper rounding
+            interval_data = {}
+            total_producer_premium = 0
+
+            for interval, alloc_pct in allocation.items():
+                if alloc_pct <= 0:
+                    continue
+
+                # Step 1: Calculate interval protection (round to integer)
+                interval_protection = int(round_half_up(total_protection * alloc_pct, 0))
+
+                # Step 2: Get premium rate for this interval
+                premium_rate = premiums.get(interval, 0)
+
+                # Step 3: Calculate total premium (round to integer)
+                total_premium_interval = int(round_half_up(interval_protection * premium_rate, 0))
+
+                # Step 4: Calculate premium subsidy (round to integer)
+                premium_subsidy = int(round_half_up(total_premium_interval * subsidy, 0))
+
+                # Step 5: Calculate producer premium (integer subtraction)
+                producer_premium_interval = total_premium_interval - premium_subsidy
+
+                total_producer_premium += producer_premium_interval
+
+                interval_data[interval] = {
+                    'protection': interval_protection,
+                    'producer_premium': producer_premium_interval
+                }
+
+            # Calculate yearly indemnity with precise rounding
+            yearly_indemnity = np.zeros(len(years))
+            yearly_roi = np.zeros(len(years))
+
+            for year_idx, year in enumerate(years):
+                year_total_indemnity = 0
+
+                for interval, data in interval_data.items():
+                    # Get index value for this interval and year
+                    interval_idx = INTERVAL_ORDER_11.index(interval)
+                    index_value = index_matrix[year_idx, interval_idx]
+
+                    # Step 6: Calculate shortfall percentage
+                    shortfall_pct = max(0, (trigger - index_value) / trigger)
+
+                    # Step 7: Calculate indemnity with threshold check
+                    raw_indemnity = shortfall_pct * data['protection']
+                    if raw_indemnity >= 0.01:
+                        indemnity = int(round_half_up(raw_indemnity, 0))
+                    else:
+                        indemnity = 0
+
+                    year_total_indemnity += indemnity
+
+                yearly_indemnity[year_idx] = year_total_indemnity
+
+                # Calculate ROI for this year
+                if total_producer_premium > 0:
+                    yearly_roi[year_idx] = (year_total_indemnity - total_producer_premium) / total_producer_premium
+                else:
+                    yearly_roi[year_idx] = 0
+
             # Aggregate metrics
-            total_indemnity_all = np.nansum(yearly_indemnity)
-            total_premium_all = yearly_producer_premium * len(years)
-            
+            total_indemnity_all = np.sum(yearly_indemnity)
+            total_premium_all = total_producer_premium * len(years)
+
             if total_premium_all > 0:
                 cumulative_roi = (total_indemnity_all - total_premium_all) / total_premium_all
             else:
                 cumulative_roi = 0
-            
+
             std_dev = np.nanstd(yearly_roi)
             risk_adj_ret = cumulative_roi / std_dev if std_dev > 0 else 0
-            
+
             result_entry = {
                 'coverage_level': coverage_level,
                 'allocation': allocation,
@@ -318,15 +376,15 @@ def run_optimization(
                 'total_premium': total_premium_all
             }
             results.append(result_entry)
-            
-            # Store yearly details (only if needed later)
+
+            # Store yearly details
             alloc_key = tuple(sorted((k, round(v, 3)) for k, v in allocation.items() if v > 0))
             year_details = [
                 {
                     'Year': int(years[i]),
                     'Total Indemnity': yearly_indemnity[i],
-                    'Producer Premium': yearly_producer_premium,
-                    'Net Return': yearly_indemnity[i] - yearly_producer_premium,
+                    'Producer Premium': total_producer_premium,
+                    'Net Return': yearly_indemnity[i] - total_producer_premium,
                     'ROI': yearly_roi[i]
                 }
                 for i in range(len(years))
